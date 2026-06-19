@@ -1,9 +1,14 @@
 /**
  * Unit tests for QuoteService SWR caching behaviour.
  *
- * All tests run entirely in-process — no network calls are made.  The global
- * `fetch` is stubbed per test so CoinGecko responses can be scripted
- * deterministically.
+ * Design principle: we stub Date.now() directly to control cache-age
+ * decisions without registering any fake timers. This avoids all
+ * interactions between vitest's fake-timer machinery and Node's internal
+ * timer queues (AbortSignal.timeout, setImmediate, etc.) that cause
+ * flakiness on CI.
+ *
+ * Background fetches are real microtask promises (the fetch mock resolves
+ * via Promise.resolve()) so we just `await` them naturally.
  */
 
 import { beforeEach, afterEach, describe, expect, it, vi, type MockInstance } from "vitest";
@@ -17,7 +22,7 @@ import { QuoteService } from "../src/services/quote-service.js";
 const NOOP_LOGGER = pino({ level: "silent" });
 
 /** A valid CoinGecko response for the ETH-XLM pair. */
-function mockCoinGeckoResponse(ethUsd: number, xlmUsd: number): Response {
+function cgResponse(ethUsd: number, xlmUsd: number): Response {
   return new Response(
     JSON.stringify({ ethereum: { usd: ethUsd }, stellar: { usd: xlmUsd } }),
     { status: 200, headers: { "Content-Type": "application/json" } }
@@ -25,23 +30,22 @@ function mockCoinGeckoResponse(ethUsd: number, xlmUsd: number): Response {
 }
 
 /** A valid CoinGecko response for the ETH-SOL pair. */
-function mockCoinGeckoSolResponse(ethUsd: number, solUsd: number): Response {
+function cgSolResponse(ethUsd: number, solUsd: number): Response {
   return new Response(
     JSON.stringify({ ethereum: { usd: ethUsd }, solana: { usd: solUsd } }),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
 }
 
-/** Advance vitest's fake timer by `ms` and flush the full microtask queue.
- *
- * The background refresh chain inside _fetchAndStore goes through at least
- * 5 async hops: fetch resolves → Response.json() resolves → cache.set →
- * _fetchAndStore returns → .catch/.finally on the inflight promise.
- * We flush 10 times to be safe across all Node 22/24 event-loop orderings.
+/**
+ * Drain the microtask queue by yielding enough times for the full async
+ * chain inside _fetchAndStore to complete:
+ *   fetch mock resolves (1) → .json() resolves (2) → cache.set (sync) →
+ *   _fetchAndStore returns (3) → .catch handler (4) → .finally (5)
+ * We yield 20 times for generous headroom across environments.
  */
-async function advanceAndFlush(ms: number): Promise<void> {
-  vi.advanceTimersByTime(ms);
-  for (let i = 0; i < 10; i++) {
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 20; i++) {
     await Promise.resolve();
   }
 }
@@ -52,21 +56,22 @@ async function advanceAndFlush(ms: number): Promise<void> {
 
 describe("QuoteService — SWR caching", () => {
   let fetchMock: MockInstance;
+  let nowMs: number;
 
   beforeEach(() => {
-    vi.useFakeTimers();
+    nowMs = 1_000_000; // arbitrary baseline
+    vi.spyOn(Date, "now").mockImplementation(() => nowMs);
     fetchMock = vi.spyOn(globalThis, "fetch");
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
-    vi.useRealTimers();
   });
 
   // ── Fresh window ──────────────────────────────────────────────────────────
 
   it("returns fresh data without hitting the upstream again within freshTtlMs", async () => {
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3000, 0.10));
+    fetchMock.mockResolvedValueOnce(cgResponse(3000, 0.10));
 
     const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 15_000, staleTtlMs: 60_000, maxStaleTtlMs: 300_000 });
 
@@ -75,58 +80,52 @@ describe("QuoteService — SWR caching", () => {
     expect(first.srcUsd).toBe(3000);
     expect(first.dstUsd).toBe(0.10);
 
-    // Advance just under the fresh window.
-    await advanceAndFlush(14_000);
+    // Advance just under the fresh window — still fresh.
+    nowMs += 14_000;
     const second = await svc.getQuote("ETH-XLM");
     expect(second.staleness).toBe("fresh");
 
-    // Upstream was only called once.
+    // Upstream called only once.
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   // ── Stale window — background refresh ─────────────────────────────────────
 
   it("serves stale data immediately and kicks off a background refresh within staleTtlMs", async () => {
-    // First call: live fetch.
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3000, 0.10));
-    // Background refresh triggered after stale window.
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3100, 0.11));
+    fetchMock.mockResolvedValueOnce(cgResponse(3000, 0.10));  // initial fetch
+    fetchMock.mockResolvedValueOnce(cgResponse(3100, 0.11));  // background refresh
 
     const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 5_000, staleTtlMs: 30_000, maxStaleTtlMs: 300_000 });
 
+    // 1. Cold-start fetch → cache holds 3000 at T=1_000_000
     await svc.getQuote("ETH-XLM");
 
-    // Advance past fresh but within stale.
-    await advanceAndFlush(10_000);
+    // 2. Advance into stale window (age = 10s > fresh 5s, < stale 30s)
+    nowMs += 10_000;
 
+    // 3. getQuote returns stale 3000 immediately AND kicks off background refresh
     const stale = await svc.getQuote("ETH-XLM");
-    // Served stale immediately.
     expect(stale.staleness).toBe("stale");
     expect(stale.srcUsd).toBe(3000);
 
-    // Wait for background refresh to settle.
-    await advanceAndFlush(100);
+    // 4. Let the background fetch's microtask chain fully complete
+    await flushMicrotasks();
 
+    // 5. Cache now holds 3100
     const refreshed = await svc.getQuote("ETH-XLM");
     expect(refreshed.srcUsd).toBe(3100);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  // ── Thundering herd: concurrent callers during cold start ─────────────────
+  // ── Thundering herd ────────────────────────────────────────────────────────
 
   it("collapses concurrent requests into a single upstream call (thundering-herd guard)", async () => {
-    // A deferred promise lets us control when the upstream resolves so all
-    // five callers are in-flight simultaneously before any resolves.
     let resolveUpstream!: (r: Response) => void;
-    const upstreamPending = new Promise<Response>((resolve) => {
-      resolveUpstream = resolve;
-    });
-
-    fetchMock.mockReturnValue(upstreamPending);
+    const upstream = new Promise<Response>((res) => { resolveUpstream = res; });
+    fetchMock.mockReturnValue(upstream);
 
     const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 15_000, staleTtlMs: 60_000, maxStaleTtlMs: 300_000 });
 
-    // Fire 5 concurrent requests — all will await the same pending promise.
     const allQuotes = Promise.all([
       svc.getQuote("ETH-XLM"),
       svc.getQuote("ETH-XLM"),
@@ -135,11 +134,10 @@ describe("QuoteService — SWR caching", () => {
       svc.getQuote("ETH-XLM"),
     ]);
 
-    // Verify fetch was only called once across all 5 concurrent calls.
+    // All 5 are in-flight but only 1 fetch was made.
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    // Now resolve the upstream — all callers should settle with the same data.
-    resolveUpstream(mockCoinGeckoResponse(3200, 0.12));
+    resolveUpstream(cgResponse(3200, 0.12));
     const [a, b, c, d, e] = await allQuotes;
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -149,7 +147,7 @@ describe("QuoteService — SWR caching", () => {
     }
   });
 
-  // ── API outage: returns fallback, not an error ─────────────────────────────
+  // ── API outage: cold start ─────────────────────────────────────────────────
 
   it("returns hardcoded fallback when the upstream is unavailable at cold start", async () => {
     fetchMock.mockRejectedValue(new Error("Network error"));
@@ -159,43 +157,40 @@ describe("QuoteService — SWR caching", () => {
 
     expect(snap.staleness).toBe("fallback");
     expect(snap.source).toBe("fallback");
-    // Hardcoded fallback prices are non-null.
     expect(snap.srcUsd).not.toBeNull();
     expect(snap.dstUsd).not.toBeNull();
   });
 
-  it("returns last-known-good entry (marked fallback) when upstream fails after a prior fetch", async () => {
-    // First call: live data.
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3000, 0.10));
-    // Second call (background refresh): upstream outage.
-    fetchMock.mockRejectedValueOnce(new Error("coingecko 503"));
+  // ── Last-known-good after outage ───────────────────────────────────────────
+
+  it("returns last-known-good (marked fallback) when upstream fails after a prior live fetch", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3000, 0.10));  // initial live
+    fetchMock.mockRejectedValueOnce(new Error("coingecko 503")); // background fails
+    fetchMock.mockRejectedValueOnce(new Error("still down"));    // blocking fetch fails
 
     const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 5_000, staleTtlMs: 30_000, maxStaleTtlMs: 300_000 });
 
-    const live = await svc.getQuote("ETH-XLM");
-    expect(live.srcUsd).toBe(3000);
+    // 1. Cold-start live fetch → 3000 in cache
+    await svc.getQuote("ETH-XLM");
 
-    // Move past fresh into stale window to trigger background refresh.
-    await advanceAndFlush(10_000);
-    await svc.getQuote("ETH-XLM"); // triggers background refresh
+    // 2. Stale window: background refresh triggered, cache entry will be
+    //    marked isFallback=true after the rejection settles
+    nowMs += 10_000;
+    await svc.getQuote("ETH-XLM");
+    await flushMicrotasks(); // let the failed refresh update the cache
 
-    // Wait for the failed refresh to settle.
-    await advanceAndFlush(100);
-
-    // Move past max-stale to force the next call to block on a new fetch —
-    // which also fails.
-    fetchMock.mockRejectedValueOnce(new Error("still down"));
-    await advanceAndFlush(400_000);
-
+    // 3. Beyond maxStaleTtl → blocking fetch, which also fails → last-known-good
+    nowMs += 400_000;
     const fallback = await svc.getQuote("ETH-XLM");
-    // Prices should be last-known-good (3000 / 0.10), not hardcoded, and
-    // marked as fallback so the UI can warn.
+
     expect(fallback.staleness).toBe("fallback");
     expect(fallback.srcUsd).toBe(3000);
     expect(fallback.dstUsd).toBe(0.10);
   });
 
-  it("returns a clear failure signal when a non-200 response is received", async () => {
+  // ── HTTP 503 ───────────────────────────────────────────────────────────────
+
+  it("returns fallback when the upstream returns a non-200 response", async () => {
     fetchMock.mockResolvedValue(new Response("Service Unavailable", { status: 503 }));
 
     const svc = new QuoteService(NOOP_LOGGER);
@@ -205,10 +200,11 @@ describe("QuoteService — SWR caching", () => {
     expect(snap.source).toBe("fallback");
   });
 
-  it("does not serve data beyond maxStaleTtlMs from the last live fetch without at least a fallback signal", async () => {
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3000, 0.10));
-    // All subsequent upstream calls fail.
-    fetchMock.mockRejectedValue(new Error("outage"));
+  // ── maxStaleTtl enforcement ────────────────────────────────────────────────
+
+  it("marks data as fallback once it is older than maxStaleTtlMs", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3000, 0.10));
+    fetchMock.mockRejectedValue(new Error("outage")); // all subsequent fail
 
     const svc = new QuoteService(NOOP_LOGGER, {
       freshTtlMs: 5_000,
@@ -218,56 +214,47 @@ describe("QuoteService — SWR caching", () => {
 
     await svc.getQuote("ETH-XLM");
 
-    // Jump well past maxStaleTtlMs.
-    await advanceAndFlush(120_000);
+    // Jump well past maxStaleTtl and flush any background attempt
+    nowMs += 120_000;
+    await flushMicrotasks();
 
     const snap = await svc.getQuote("ETH-XLM");
-    // staleness must be "fallback" — the service must not return "fresh" or
-    // "stale" for data older than maxStaleTtlMs.
     expect(snap.staleness).toBe("fallback");
-    // But prices should still be last-known-good, not null.
-    expect(snap.srcUsd).not.toBeNull();
+    expect(snap.srcUsd).not.toBeNull(); // last-known-good, not null
   });
 
-  // ── Background refresh does not block callers ──────────────────────────────
+  // ── Non-blocking background refresh ───────────────────────────────────────
 
-  it("never blocks the current caller during a background refresh", async () => {
-    // Initial live fetch: resolves immediately.
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3000, 0.10));
+  it("never blocks the current caller while background refresh is in-flight", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3000, 0.10));
 
-    // Background refresh: resolves only after the test completes.
-    // We use a deferred that we resolve in cleanup to avoid vitest
-    // detecting an unresolved promise on teardown.
+    // Slow background fetch — resolves after the assertion
     let resolveBackground!: (r: Response) => void;
-    const backgroundPending = new Promise<Response>((res) => { resolveBackground = res; });
-    fetchMock.mockReturnValueOnce(backgroundPending);
+    const bg = new Promise<Response>((res) => { resolveBackground = res; });
+    fetchMock.mockReturnValueOnce(bg);
 
     const svc = new QuoteService(NOOP_LOGGER, { freshTtlMs: 5_000, staleTtlMs: 30_000, maxStaleTtlMs: 300_000 });
 
     await svc.getQuote("ETH-XLM");
 
-    // Enter the stale window — next call triggers a background refresh.
-    await advanceAndFlush(10_000);
-
-    // This call must return with stale data immediately, without blocking on
-    // the pending background refresh.
+    // Enter stale window — next getQuote kicks off background refresh
+    nowMs += 10_000;
     const snap = await svc.getQuote("ETH-XLM");
 
-    expect(snap.srcUsd).toBe(3000); // stale data returned synchronously
+    // Must return stale immediately without blocking on the slow fetch
+    expect(snap.srcUsd).toBe(3000);
     expect(snap.staleness).toBe("stale");
-    // fetch was called twice: initial + background refresh kick-off.
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
-    // Resolve the background promise so vitest teardown doesn't see a
-    // dangling pending promise.
-    resolveBackground(mockCoinGeckoResponse(3000, 0.10));
-    await backgroundPending;
+    // Clean up — resolve so vitest teardown has no dangling promise
+    resolveBackground(cgResponse(3050, 0.105));
+    await bg;
   });
 
-  // ── quoteEthXlm convenience method ────────────────────────────────────────
+  // ── quoteEthXlm wrapper ────────────────────────────────────────────────────
 
-  it("quoteEthXlm() returns stringified prices and staleness metadata", async () => {
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(3400, 0.11));
+  it("quoteEthXlm() returns stringified prices with staleness metadata", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(3400, 0.11));
 
     const svc = new QuoteService(NOOP_LOGGER);
     const result = await svc.quoteEthXlm();
@@ -279,31 +266,29 @@ describe("QuoteService — SWR caching", () => {
     expect(typeof result.ageMs).toBe("number");
   });
 
-  // ── ETH-SOL pair ─────────────────────────────────────────────────────────
+  // ── Independent pair caches ────────────────────────────────────────────────
 
   it("caches ETH-XLM and ETH-SOL independently", async () => {
     fetchMock.mockImplementation((url: string) => {
       if (String(url).includes("stellar")) {
-        return Promise.resolve(mockCoinGeckoResponse(3000, 0.10));
+        return Promise.resolve(cgResponse(3000, 0.10));
       }
-      return Promise.resolve(mockCoinGeckoSolResponse(3000, 160));
+      return Promise.resolve(cgSolResponse(3000, 160));
     });
 
     const svc = new QuoteService(NOOP_LOGGER);
-
     const xlm = await svc.getQuote("ETH-XLM");
     const sol = await svc.getQuote("ETH-SOL");
 
     expect(xlm.dstUsd).toBe(0.10);
     expect(sol.dstUsd).toBe(160);
-    // Two separate upstream calls — one per pair.
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  // ── rate field ────────────────────────────────────────────────────────────
+  // ── rate field ─────────────────────────────────────────────────────────────
 
-  it("computes the correct rate field as srcUsd / dstUsd", async () => {
-    fetchMock.mockResolvedValueOnce(mockCoinGeckoResponse(4000, 0.20));
+  it("computes rate as srcUsd / dstUsd", async () => {
+    fetchMock.mockResolvedValueOnce(cgResponse(4000, 0.20));
 
     const svc = new QuoteService(NOOP_LOGGER);
     const snap = await svc.getQuote("ETH-XLM");
