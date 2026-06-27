@@ -1,4 +1,3 @@
-#53-Add-frontend-linting-rules-for-complex-form-logic-and-BridgeForm-maintainability-FIX
 import BridgeFormContainer, { type BridgeFormProps } from '../features/bridge/BridgeFormContainer';
 
 /**
